@@ -1,7 +1,6 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -80,47 +79,8 @@ const INTERNAL_GATEWAY_PORT = Number.parseInt(
   process.env.INTERNAL_GATEWAY_PORT ?? "18789",
   10,
 );
-
-// Robustly parse the internal gateway host.
-function resolveInternalHost() {
-  const envHost = (process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1").trim().replace(/^["']|["']$/g, "").trim();
-
-  // If the gateway is local (managed by this wrapper), we MUST use 127.0.0.1
-  // because the gateway binds to loopback only.
-  if (envHost && envHost !== "127.0.0.1" && envHost !== "localhost") {
-    console.log(`[wrapper] NOTE: INTERNAL_GATEWAY_HOST is set to ${envHost}.`);
-    console.log(`[wrapper] Overriding to 127.0.0.1 for internal communication with the managed gateway.`);
-  }
-
-  return "127.0.0.1";
-}
-
-// Extract public host from INTERNAL_GATEWAY_HOST for external URLs
-function resolvePublicHost() {
-  let host = (process.env.INTERNAL_GATEWAY_HOST ?? "").trim().replace(/^["']|["']$/g, "").trim();
-  if (!host || host === "127.0.0.1" || host === "localhost") {
-    return null; // No public host configured
-  }
-  // Parse URL or extract hostname
-  if (host.includes("://")) {
-    try {
-      return new URL(host).origin; // e.g., "https://ai.ziph.org"
-    } catch {
-      // fallback
-    }
-  }
-  // If no protocol, assume https
-  return `https://${host.split("/")[0].split(":")[0]}`;
-}
-
-const INTERNAL_GATEWAY_HOST = resolveInternalHost();
-const PUBLIC_HOST = resolvePublicHost();
+const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
-
-console.log(`[wrapper] Internal Gateway target: ${GATEWAY_TARGET}`);
-if (PUBLIC_HOST) {
-  console.log(`[wrapper] Public host for external access: ${PUBLIC_HOST}`);
-}
 
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
 const OPENCLAW_ENTRY =
@@ -154,40 +114,25 @@ function sleep(ms) {
 }
 
 async function waitForGatewayReady(opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 60_000;
+  const timeoutMs = opts.timeoutMs ?? 20_000;
   const start = Date.now();
-
-  console.log(`[gateway] waiting for TCP port ${INTERNAL_GATEWAY_PORT} on ${INTERNAL_GATEWAY_HOST} (timeout ${timeoutMs}ms)...`);
+  const endpoints = ["/openclaw", "/openclaw", "/", "/health"];
 
   while (Date.now() - start < timeoutMs) {
-    try {
-      await new Promise((resolve, reject) => {
-        const socket = net.connect(INTERNAL_GATEWAY_PORT, INTERNAL_GATEWAY_HOST);
-        socket.on("connect", () => {
-          socket.destroy();
-          resolve();
-        });
-        socket.on("error", (err) => {
-          socket.destroy();
-          reject(err);
-        });
-        // Short timeout for individual probe
-        socket.setTimeout(1000);
-        socket.on("timeout", () => {
-          socket.destroy();
-          reject(new Error("timeout"));
-        });
-      });
-
-      console.log(`[gateway] port ${INTERNAL_GATEWAY_PORT} is open`);
-      return true;
-    } catch (err) {
-      // not ready yet
-      debug(`[gateway] probe failed: ${err.message}`);
+    for (const endpoint of endpoints) {
+      try {
+        const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, { method: "GET" });
+        // Any HTTP response means the port is open.
+        if (res) {
+          console.log(`[gateway] ready at ${endpoint}`);
+          return true;
+        }
+      } catch (err) {
+        // not ready, try next endpoint
+      }
     }
-    await sleep(1000);
+    await sleep(250);
   }
-
   console.error(`[gateway] failed to become ready after ${timeoutMs}ms`);
   return false;
 }
@@ -287,7 +232,7 @@ async function ensureGatewayRunning() {
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       await startGateway();
-      const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
+      const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
       if (!ready) {
         throw new Error("Gateway did not become ready in time");
       }
@@ -591,12 +536,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
     const ok = onboard.code === 0 && isConfigured();
 
-    // Cleanup: run doctor --fix to remove any unsupported or invalid config keys
-    if (ok) {
-      console.log("[onboard] Running doctor --fix to clean up configuration...");
-      await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
-    }
-
     // DIAGNOSTIC: Check what token onboard actually wrote to config
     if (ok) {
       try {
@@ -693,21 +632,6 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         OPENCLAW_NODE,
         clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]),
       );
-
-      // Set public host for external access (images, Control UI, etc.)
-      if (PUBLIC_HOST) {
-        console.log(`[onboard] Setting gateway.publicHost to ${PUBLIC_HOST}`);
-        await runCmd(
-          OPENCLAW_NODE,
-          clawArgs(["config", "set", "gateway.publicHost", PUBLIC_HOST]),
-        );
-        // Trust the wrapper as a reverse proxy
-        await runCmd(
-          OPENCLAW_NODE,
-          clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]),
-        );
-      }
-
 
       const channelsHelp = await runCmd(
         OPENCLAW_NODE,
