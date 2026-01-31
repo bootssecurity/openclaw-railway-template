@@ -82,36 +82,44 @@ const INTERNAL_GATEWAY_PORT = Number.parseInt(
 );
 
 // Robustly parse the internal gateway host.
-// It might be a raw IP/domain, or a quoted URL from a environment variable list.
 function resolveInternalHost() {
-  let host = (process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1").trim();
-  // Strip surrounding quotes if present (common in some shell/env setups)
-  host = host.replace(/^["']|["']$/g, "").trim();
+  const envHost = (process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1").trim().replace(/^["']|["']$/g, "").trim();
 
+  // If the gateway is local (managed by this wrapper), we MUST use 127.0.0.1
+  // because the gateway binds to loopback only.
+  if (envHost && envHost !== "127.0.0.1" && envHost !== "localhost") {
+    console.log(`[wrapper] NOTE: INTERNAL_GATEWAY_HOST is set to ${envHost}.`);
+    console.log(`[wrapper] Overriding to 127.0.0.1 for internal communication with the managed gateway.`);
+  }
+
+  return "127.0.0.1";
+}
+
+// Extract public host from INTERNAL_GATEWAY_HOST for external URLs
+function resolvePublicHost() {
+  let host = (process.env.INTERNAL_GATEWAY_HOST ?? "").trim().replace(/^["']|["']$/g, "").trim();
+  if (!host || host === "127.0.0.1" || host === "localhost") {
+    return null; // No public host configured
+  }
+  // Parse URL or extract hostname
   if (host.includes("://")) {
     try {
-      const u = new URL(host);
-      host = u.hostname;
+      return new URL(host).origin; // e.g., "https://ai.ziph.org"
     } catch {
-      // Fallback: manual strip if URL parser fails
-      host = host.replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+      // fallback
     }
-  } else {
-    // Just in case it has a port or path but no protocol
-    host = host.split("/")[0].split(":")[0];
   }
-  return host || "127.0.0.1";
+  // If no protocol, assume https
+  return `https://${host.split("/")[0].split(":")[0]}`;
 }
 
 const INTERNAL_GATEWAY_HOST = resolveInternalHost();
+const PUBLIC_HOST = resolvePublicHost();
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
 
-console.log(`[wrapper] Gateway target: ${GATEWAY_TARGET} (host=${INTERNAL_GATEWAY_HOST}, port=${INTERNAL_GATEWAY_PORT})`);
-
-if (INTERNAL_GATEWAY_HOST !== "127.0.0.1" && INTERNAL_GATEWAY_HOST !== "localhost") {
-  console.warn(`[wrapper] ⚠️  WARNING: INTERNAL_GATEWAY_HOST is set to ${INTERNAL_GATEWAY_HOST}.`);
-  console.warn(`[wrapper]    For a local OpenClaw gateway, 127.0.0.1 is usually required.`);
-  console.warn(`[wrapper]    Public domains may fail if the port is not exposed externally.`);
+console.log(`[wrapper] Internal Gateway target: ${GATEWAY_TARGET}`);
+if (PUBLIC_HOST) {
+  console.log(`[wrapper] Public host for external access: ${PUBLIC_HOST}`);
 }
 
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
@@ -685,6 +693,21 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
         OPENCLAW_NODE,
         clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]),
       );
+
+      // Set public host for external access (images, Control UI, etc.)
+      if (PUBLIC_HOST) {
+        console.log(`[onboard] Setting gateway.publicHost to ${PUBLIC_HOST}`);
+        await runCmd(
+          OPENCLAW_NODE,
+          clawArgs(["config", "set", "gateway.publicHost", PUBLIC_HOST]),
+        );
+        // Trust the wrapper as a reverse proxy
+        await runCmd(
+          OPENCLAW_NODE,
+          clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]),
+        );
+      }
+
 
       const channelsHelp = await runCmd(
         OPENCLAW_NODE,
