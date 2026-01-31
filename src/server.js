@@ -1,6 +1,7 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -79,8 +80,39 @@ const INTERNAL_GATEWAY_PORT = Number.parseInt(
   process.env.INTERNAL_GATEWAY_PORT ?? "18789",
   10,
 );
-const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
+
+// Robustly parse the internal gateway host.
+// It might be a raw IP/domain, or a quoted URL from a environment variable list.
+function resolveInternalHost() {
+  let host = (process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1").trim();
+  // Strip surrounding quotes if present (common in some shell/env setups)
+  host = host.replace(/^["']|["']$/g, "").trim();
+
+  if (host.includes("://")) {
+    try {
+      const u = new URL(host);
+      host = u.hostname;
+    } catch {
+      // Fallback: manual strip if URL parser fails
+      host = host.replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+    }
+  } else {
+    // Just in case it has a port or path but no protocol
+    host = host.split("/")[0].split(":")[0];
+  }
+  return host || "127.0.0.1";
+}
+
+const INTERNAL_GATEWAY_HOST = resolveInternalHost();
 const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
+
+console.log(`[wrapper] Gateway target: ${GATEWAY_TARGET} (host=${INTERNAL_GATEWAY_HOST}, port=${INTERNAL_GATEWAY_PORT})`);
+
+if (INTERNAL_GATEWAY_HOST !== "127.0.0.1" && INTERNAL_GATEWAY_HOST !== "localhost") {
+  console.warn(`[wrapper] ⚠️  WARNING: INTERNAL_GATEWAY_HOST is set to ${INTERNAL_GATEWAY_HOST}.`);
+  console.warn(`[wrapper]    For a local OpenClaw gateway, 127.0.0.1 is usually required.`);
+  console.warn(`[wrapper]    Public domains may fail if the port is not exposed externally.`);
+}
 
 // Always run the built-from-source CLI entry directly to avoid PATH/global-install mismatches.
 const OPENCLAW_ENTRY =
@@ -116,28 +148,38 @@ function sleep(ms) {
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const start = Date.now();
-  const endpoints = ["/openclaw", "/openclaw", "/", "/health"];
-  
-  console.log(`[gateway] waiting for readiness (timeout ${timeoutMs}ms)...`);
-  
+
+  console.log(`[gateway] waiting for TCP port ${INTERNAL_GATEWAY_PORT} on ${INTERNAL_GATEWAY_HOST} (timeout ${timeoutMs}ms)...`);
+
   while (Date.now() - start < timeoutMs) {
-    for (const endpoint of endpoints) {
-      try {
-        const url = `${GATEWAY_TARGET}${endpoint}`;
-        debug(`[gateway] probing ${url}...`);
-        const res = await fetch(url, { method: "GET" });
-        // Any HTTP response means the port is open.
-        if (res) {
-          console.log(`[gateway] ready at ${endpoint} (status: ${res.status})`);
-          return true;
-        }
-      } catch (err) {
-        // not ready, try next endpoint
-        debug(`[gateway] probe ${endpoint} failed: ${err.message}`);
-      }
+    try {
+      await new Promise((resolve, reject) => {
+        const socket = net.connect(INTERNAL_GATEWAY_PORT, INTERNAL_GATEWAY_HOST);
+        socket.on("connect", () => {
+          socket.destroy();
+          resolve();
+        });
+        socket.on("error", (err) => {
+          socket.destroy();
+          reject(err);
+        });
+        // Short timeout for individual probe
+        socket.setTimeout(1000);
+        socket.on("timeout", () => {
+          socket.destroy();
+          reject(new Error("timeout"));
+        });
+      });
+
+      console.log(`[gateway] port ${INTERNAL_GATEWAY_PORT} is open`);
+      return true;
+    } catch (err) {
+      // not ready yet
+      debug(`[gateway] probe failed: ${err.message}`);
     }
-    await sleep(500);
+    await sleep(1000);
   }
+
   console.error(`[gateway] failed to become ready after ${timeoutMs}ms`);
   return false;
 }
@@ -541,6 +583,12 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
 
     const ok = onboard.code === 0 && isConfigured();
 
+    // Cleanup: run doctor --fix to remove any unsupported or invalid config keys
+    if (ok) {
+      console.log("[onboard] Running doctor --fix to clean up configuration...");
+      await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+    }
+
     // DIAGNOSTIC: Check what token onboard actually wrote to config
     if (ok) {
       try {
@@ -850,7 +898,7 @@ app.get("/setup/export", requireSetupAuth, async (_req, res) => {
       portable: true,
       noMtime: true,
       cwd,
-      onwarn: () => {},
+      onwarn: () => { },
     },
     paths,
   );
